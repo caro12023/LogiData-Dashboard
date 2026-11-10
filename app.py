@@ -6150,30 +6150,40 @@ def _logidata_dashboard():
     raw_dataframe = st.dataframe
     raw_plotly_chart = st.plotly_chart
     chart_serial = [0]
-    # Solo etiquetas de presentación, sin alterar rutas ni identificadores originales.
+    # Numeración de presentación independiente para FI y FII.
+    # Las claves del Excel y los recorridos originales NUNCA se modifican.
     route_display_names = {}
 
-    def _clean_route_key(value):
+    def _route_identity(value, phase=None):
         raw = str(value).strip()
         for prefix in ('FII-', 'FI-'):
             if raw.upper().startswith(prefix):
-                return raw[len(prefix):]
-        return raw
+                return prefix[:-1], raw[len(prefix):]
+        return phase, raw
 
-    def _route_ordinal(value):
-        raw = _clean_route_key(value)
-        if raw in route_display_names:
-            return route_display_names[raw]
+    def _route_ordinal(value, phase=None):
+        phase, raw = _route_identity(value, phase)
+        if (phase, raw) in route_display_names:
+            return route_display_names[(phase, raw)]
+        # Ruta con fase ausente: resolver solo si no existe ambigüedad.
+        matches = [v for (p, rid), v in route_display_names.items() if rid == raw]
+        if phase is None and len(matches) == 1:
+            return matches[0]
         last = re.search(r'(?:R[-_])?(?:[A-Za-z0-9]+[-_])*0*(\d+)$', raw, re.I)
         return int(last.group(1)) if last else None
 
-    def friendly_route(value):
-        ordinal = _route_ordinal(value)
+    def friendly_route(value, phase=None):
+        ordinal = _route_ordinal(value, phase)
         return f'Ruta {ordinal}' if ordinal is not None else 'Ruta'
 
-    def friendly_vehicle(value):
-        ordinal = _route_ordinal(value)
+    def friendly_vehicle(value, phase=None):
+        ordinal = _route_ordinal(value, phase)
         return f'Vehículo {ordinal}' if ordinal is not None else 'Vehículo'
+
+    def friendly_vehicle_phase(value, phase=None):
+        resolved, _ = _route_identity(value, phase)
+        phase_label = {'FI': 'Fase I', 'FII': 'Fase II'}.get(resolved, '')
+        return (phase_label + ' · ' if phase_label else '') + friendly_vehicle(value, phase)
 
     def friendly_alternative(value):
         raw = str(value).strip()
@@ -6194,10 +6204,14 @@ def _logidata_dashboard():
         shown = shown.drop(columns=[c for c in shown if c.lower().strip() in internal], errors='ignore')
         for col in shown.columns:
             norm = str(col).lower().strip()
-            if norm in ('ruta_id', 'ruta'):
-                shown[col] = shown[col].map(friendly_route)
-            elif norm == 'vehiculo':
-                shown[col] = shown[col].map(friendly_vehicle)
+            if norm in ('ruta_id', 'ruta', 'vehiculo'):
+                labeler = friendly_vehicle if norm == 'vehiculo' else friendly_route
+                # En tablas comparativas usar la fase de cada fila.
+                if 'fase' in shown.columns:
+                    shown[col] = [labeler(value, phase=phase)
+                                  for value, phase in zip(shown[col], shown['fase'])]
+                else:
+                    shown[col] = shown[col].map(lambda value: labeler(value, phase=active))
             elif norm in ('candidato','candidata'):
                 shown[col] = shown[col].map(friendly_alternative)
         return shown
@@ -6463,7 +6477,7 @@ def _logidata_dashboard():
         return coords_table(next(iter(df.values())), kind)
 
 
-    def map_figure(routes, visits, coords, title='Rutas LogiData', modo_coordenadas=False, map_order_route=None):
+    def map_figure(routes, visits, coords, title='Rutas LogiData', modo_coordenadas=False, map_order_route=None, phase=None):
         # """Map of actual recorded visit order; connecting lines are schematic."""
         if coords.empty or routes.empty or visits.empty:
             return None
@@ -6489,7 +6503,7 @@ def _logidata_dashboard():
             operations = stops.operacion.astype(str).str.upper().tolist()
             if operations[0] != 'DEPOT_START' or operations[-1] != 'DEPOT_END':
                 # Never fabricate a route when the exported sequence is incomplete.
-                no_coords.append(friendly_route(route.ruta_id))
+                no_coords.append(friendly_route(route.ruta_id, phase=phase))
                 continue
             # Use precisely the recorded warehouse/visits and the recorded order.
             color = PALETTE[idx % len(PALETTE)]
@@ -6505,14 +6519,14 @@ def _logidata_dashboard():
                 used_positions.append(position)
                 valid_count += 1
             if valid_count < 2:
-                no_coords.append(friendly_route(route.ruta_id));continue
+                no_coords.append(friendly_route(route.ruta_id, phase=phase));continue
             if valid_count != len(ids):
-                no_coords.append(friendly_route(route.ruta_id))
+                no_coords.append(friendly_route(route.ruta_id, phase=phase))
             # Do not draw fake shortcuts across stops without coordinates.
             fig.add_trace(go.Scattermap(
                 lat=segments_y, lon=segments_x, mode='lines',
                 line=dict(color=color, width=5 if one_route else 3.5),
-                name=friendly_vehicle(route.ruta_id),
+                name=friendly_vehicle(route.ruta_id, phase=phase),
                 customdata=[[str(route.ruta_id),num(route.km,0),num(route.minutos,0)]
                             if x is not None else [str(route.ruta_id),0,0] for x in segments_x],
                 hovertemplate='Recorrido · %{customdata[1]:.2f} km · %{customdata[2]:.2f} min<extra></extra>',
@@ -6541,7 +6555,7 @@ def _logidata_dashboard():
                                 f'{fmt_num(stop.cantidad,2)} unidades · '
                                 f'carga posterior {fmt_num(stop.carga_despues,2)} unidades')
                         hover_details.append(f'Cliente {node}<br>'+'<br>'.join(detail)+
-                                             f'<br>{friendly_vehicle(route.ruta_id)} · Bodega {depot_id}')
+                                             f'<br>{friendly_vehicle(route.ruta_id, phase=phase)} · Bodega {depot_id}')
                     number_traces.append(go.Scattermap(
                         lat=[x['lat'] for x in locations],
                         lon=[x['lon'] for x in locations],
@@ -6551,7 +6565,7 @@ def _logidata_dashboard():
                         textposition='middle center',textfont=dict(size=12,color=NAVY),
                         customdata=hover_details,
                         hovertemplate='%{customdata}<extra></extra>',
-                        name=f'Orden de visita · {friendly_vehicle(route.ruta_id)}',
+                        name=f'Orden de visita · {friendly_vehicle(route.ruta_id, phase=phase)}',
                         showlegend=True))
         if not displayed_stops:
             return None
@@ -6973,9 +6987,12 @@ def _logidata_dashboard():
     control=rowdict(book,'Control_Ejecucion')
     phase_data={p:build_phase(book,p) for p in ('FI','FII')}
     # Numeración legible y unívoca entre bodegas, independiente del ID interno.
-    all_route_ids=sorted({str(x) for phase in phase_data.values()
-        for x in (phase['routes']['ruta_id'].tolist() if not phase['routes'].empty else [])})
-    route_display_names.update({route_id:i+1 for i,route_id in enumerate(all_route_ids)})
+    for phase_id, pdata in phase_data.items():
+        route_ids = (pdata['routes']['ruta_id'].astype(str).tolist()
+                     if not pdata['routes'].empty else [])
+        # Orden estable dentro de cada fase: FI = 1..10, FII = 1..8.
+        route_display_names.update({(phase_id, route_id): i + 1
+                                    for i, route_id in enumerate(route_ids)})
     summaries={p:phase_summary(phase_data[p],comparison,p) for p in ('FI','FII')}
     raw_fee=pick(control,'costo_diario_arriendo_vehiculo','arriendo_diario_vehiculo',default=np.nan)
     km_fee=pick(control,'costo_cop_km',default=np.nan)
@@ -7169,13 +7186,13 @@ def _logidata_dashboard():
             route_ids_map=rr.ruta_id.astype(str).tolist()
             highlighted=st.selectbox('Numerar las visitas del vehículo',
                 route_ids_map if route_ids_map else ['Sin rutas'],
-                format_func=lambda x: friendly_vehicle(x) if x!='Sin rutas' else 'Sin rutas',
+                format_func=lambda x: friendly_vehicle(x, phase=active) if x!='Sin rutas' else 'Sin rutas',
                 key='general_route_highlight')
             modo_offline=st.checkbox('Ver coordenadas si el mapa de calles no carga',
                 value=False,key='mapa_general_coordenadas',help='Modo sin conexión, con ejes de latitud y longitud')
             fig=map_figure(rr,phase_data[active]['visits'],coords,
                 'Rutas y bodegas abiertas',modo_coordenadas=modo_offline,
-                map_order_route=highlighted if highlighted!='Sin rutas' else None)
+                map_order_route=highlighted if highlighted!='Sin rutas' else None, phase=active)
             if fig:
                 show_chart(fig,use_container_width=True)
                 st.caption('Las conexiones son segmentos rectos esquemáticos entre coordenadas reales; no representan la geometría de las calles.')
@@ -7186,7 +7203,7 @@ def _logidata_dashboard():
                 steps=steps[steps.ruta_id.astype(str)==str(highlighted)].sort_values('orden')
                 route_row=rr[rr.ruta_id.astype(str)==str(highlighted)]
                 if not steps.empty and not route_row.empty:
-                    st.markdown(f'#### Orden real de visita · {friendly_vehicle(highlighted)}')
+                    st.markdown(f'#### Orden real de visita · {friendly_vehicle(highlighted, phase=active)}')
                     st.caption('Salida y regreso a la bodega incluidos. Si un cliente tiene entrega y recogida, sus dos números se muestran juntos en el mapa.')
                     st.write('  →  '.join([('Bodega '+str(x.nodo_id) if x.operacion.startswith('DEPOT')
                           else str(int(x.orden))+'. Cliente '+str(x.nodo_id))
@@ -7205,7 +7222,7 @@ def _logidata_dashboard():
             chosen_depot=st.selectbox('Bodega', ['Todas']+depot_ids, key='route_depot')
             visible=rr if chosen_depot=='Todas' else rr[rr.bodega_id==chosen_depot]
             route_id=st.selectbox('Ruta / vehículo', visible.ruta_id.tolist(), key='route_detail',
-                format_func=friendly_vehicle)
+                format_func=lambda x: friendly_vehicle(x, phase=active))
             if route_id is None:
                 st.info('Selecciona al menos una bodega para mostrar una ruta.')
                 st.info('No existen rutas para esa selección.')
@@ -7222,8 +7239,8 @@ def _logidata_dashboard():
             modo_offline_ruta=st.checkbox('Ver coordenadas si el mapa de calles no carga',
                 value=False,key='mapa_individual_coordenadas')
             fig=map_figure(r,pdata['visits'],coords,
-                f'{friendly_route(route_id)} · salida y regreso a bodega {dr.bodega}',
-                modo_coordenadas=modo_offline_ruta)
+                f'{friendly_route(route_id, phase=active)} · salida y regreso a bodega {dr.bodega}',
+                modo_coordenadas=modo_offline_ruta, phase=active)
             if fig:
                 show_chart(fig,use_container_width=True)
 
@@ -7384,7 +7401,7 @@ def _logidata_dashboard():
             eligible=routes_all[routes_all.fase.isin(phases_sel)&routes_all.bodega.isin(depots_sel)]
             route_select=st.multiselect('Vehículos / rutas',sorted(eligible.vehiculo.unique()),
                                       default=sorted(eligible.vehiculo.unique()),key='fleet_vehicle_filter',
-                                      format_func=friendly_vehicle)
+                                      format_func=friendly_vehicle_phase)
             visible=eligible[eligible.vehiculo.isin(route_select)]
             data_table(visible,use_container_width=True,hide_index=True)
             download_csv(visible,'LogiData_rutas_vehiculos.csv','fleet_csv')
@@ -7404,7 +7421,8 @@ def _logidata_dashboard():
             if not visible.empty and {'vehiculo','km','costo_ruta_diario'} <= set(visible.columns):
                 # Nombres breves también en el hover; sin códigos internos de ruta.
                 visible_plot=visible.copy()
-                visible_plot['vehiculo']=visible_plot.vehiculo.map(friendly_vehicle)
+                visible_plot['vehiculo']=[friendly_vehicle_phase(value, phase=phase)
+                                            for value, phase in zip(visible_plot.vehiculo,visible_plot.fase)]
                 distance_plot = px.bar(visible_plot, y='vehiculo', x='km', color='fase',
                     orientation='h', barmode='group', color_discrete_map={'FI':BLUE,'FII':TEAL},
                     labels={'vehiculo':'Vehículo','km':'Kilómetros','fase':'Fase'},
@@ -7470,7 +7488,7 @@ def _logidata_dashboard():
             filtered_routes=phase_r if dep_selected=='Todas' else phase_r[phase_r.bodega_id==dep_selected]
             ids=sorted(filtered_routes.ruta_id.unique().tolist())
             route_selected=st.selectbox('Vehículo / ruta', ['Todos']+ids,key='fleet_route_detail',
-                format_func=lambda x: x if x=='Todos' else friendly_vehicle(x))
+                format_func=lambda x: x if x=='Todos' else friendly_vehicle(x, phase=f_sel))
             r_ids=ids if route_selected=='Todos' else [route_selected]
             rows=phase_v[phase_v.ruta_id.isin(r_ids)].copy().sort_values(['ruta_id','orden'])
             if not rows.empty:
